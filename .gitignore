@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
+*.ipynb_checkpoints
+outputs/figures/*.png
+outputs/figures/*.pdf
+outputs/embeddings/*.csv
+outputs/models/*.npz
+outputs/models/*.json
+outputs/models/*.pkl
+outputs/models/*.joblib
+data/processed/*.parquet
+data/processed/*.csv
