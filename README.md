@@ -49,6 +49,12 @@ pip install -r requirements.txt
 python -m src.pipeline all --data-dir data/raw --output-dir outputs --processed-dir data/processed
 ```
 
+For Streamlit deployment bootstrap (faster than `all`, generates required app artifacts):
+
+```bash
+python -m src.pipeline app --data-dir data/raw --output-dir outputs --processed-dir data/processed
+```
+
 Optional performance controls for very large ratings files:
 
 ```bash
@@ -60,6 +66,16 @@ python -m src.pipeline all --data-dir data/raw --max-ratings 5000000 --max-users
 ```bash
 streamlit run src/app/streamlit_app.py
 ```
+
+### Deployment Auto-Run Notes
+
+- On startup, the app now auto-runs `python -m src.pipeline app` if required artifacts are missing or stale.
+- If `data/raw` is empty, it attempts to download MovieLens from:
+  - `MOVIELENS_DATA_URL` (env var or Streamlit secrets)
+  - fallback default: `https://files.grouplens.org/datasets/movielens/ml-latest-small.zip`
+- Optional tuning knobs:
+  - `AUTO_PIPELINE_MAX_RATINGS` (force cap on ratings rows)
+  - `AUTO_PIPELINE_FALLBACK_MAX_RATINGS` (retry cap after a failed full attempt; default `1000000`)
 
 ## Outputs
 
