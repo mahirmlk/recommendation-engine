@@ -2,8 +2,13 @@ from __future__ import annotations
 
 # ── Standard library ──────────────────────────────────────────────────────────
 from pathlib import Path
+import os
 import sys
 import json
+import shutil
+import traceback
+import zipfile
+from urllib.request import Request, urlopen
 
 # ── Third-party ───────────────────────────────────────────────────────────────
 import numpy as np
@@ -30,6 +35,7 @@ PROCESSED  = ROOT / "data" / "processed"
 MODELS     = ROOT / "outputs" / "models"
 EMBEDDINGS = ROOT / "outputs" / "embeddings"
 OUTPUTS    = ROOT / "outputs"
+DEFAULT_MOVIELENS_URL = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
 
 REQUIRED_ARTIFACTS = [
     PROCESSED / "movies_enriched.parquet",
@@ -44,6 +50,7 @@ RAW_SCHEMA_CANDIDATES = [
     ("ratings.dat", "movies.dat"),
     ("u.data", "u.item"),
 ]
+RAW_OPTIONAL_FILES = {"users.csv", "users.dat", "u.user", "links.csv", "tags.csv"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -386,6 +393,73 @@ def detect_raw_dataset_files() -> list[Path]:
     return []
 
 
+def get_setting(name: str, default: str = "") -> str:
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    try:
+        secret_value = st.secrets.get(name, "")
+    except Exception:
+        secret_value = ""
+    return str(secret_value).strip() or default
+
+
+def get_optional_int_setting(name: str) -> int | None:
+    raw = get_setting(name)
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+        return value if value > 0 else None
+    except ValueError:
+        return None
+
+
+def extract_movielens_zip(zip_path: Path) -> int:
+    allowed = {name for schema in RAW_SCHEMA_CANDIDATES for name in schema} | RAW_OPTIONAL_FILES
+    extracted = 0
+    with zipfile.ZipFile(zip_path) as archive:
+        for member in archive.namelist():
+            if member.endswith("/"):
+                continue
+            filename = Path(member).name
+            if filename not in allowed:
+                continue
+            target = RAW / filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+            extracted += 1
+    return extracted
+
+
+def ensure_raw_dataset_available() -> tuple[bool, str]:
+    if detect_raw_dataset_files():
+        return True, ""
+
+    dataset_url = get_setting("MOVIELENS_DATA_URL", DEFAULT_MOVIELENS_URL)
+    if not dataset_url:
+        return False, "no dataset URL configured"
+
+    RAW.mkdir(parents=True, exist_ok=True)
+    archive_path = RAW / "_movielens_download.zip"
+    try:
+        request = Request(dataset_url, headers={"User-Agent": "recommendation-engine/streamlit"})
+        with urlopen(request, timeout=300) as response, archive_path.open("wb") as out_file:
+            shutil.copyfileobj(response, out_file)
+
+        extracted = extract_movielens_zip(archive_path)
+        if extracted == 0:
+            return False, "downloaded archive did not contain supported MovieLens files"
+        if not detect_raw_dataset_files():
+            return False, "downloaded files but could not detect MovieLens ratings/movies schema"
+        return True, ""
+    except Exception as exc:
+        return False, f"dataset download failed: {type(exc).__name__}: {exc}"
+    finally:
+        archive_path.unlink(missing_ok=True)
+
+
 def pipeline_needs_refresh() -> tuple[bool, str]:
     missing = [path for path in REQUIRED_ARTIFACTS if not path.exists()]
     if missing:
@@ -402,45 +476,138 @@ def pipeline_needs_refresh() -> tuple[bool, str]:
     return False, ""
 
 
-def auto_run_pipeline_if_needed() -> None:
-    if st.session_state.get("_auto_pipeline_checked"):
-        return
-    st.session_state["_auto_pipeline_checked"] = True
+def run_pipeline_once(max_ratings: int | None = None) -> None:
+    from src.pipeline import build_arg_parser, run_pipeline
 
+    parser = build_arg_parser()
+    args_list = [
+        "app",
+        "--data-dir",
+        str(RAW),
+        "--processed-dir",
+        str(PROCESSED),
+        "--output-dir",
+        str(OUTPUTS),
+    ]
+    if max_ratings:
+        args_list.extend(["--max-ratings", str(max_ratings)])
+    args = parser.parse_args(args_list)
+    run_pipeline(args)
+
+
+def auto_run_pipeline_if_needed() -> None:
     should_run, reason = pipeline_needs_refresh()
     if not should_run:
+        st.session_state["_auto_pipeline_done"] = True
+        st.session_state["_auto_pipeline_attempted"] = False
         return
 
-    raw_files = detect_raw_dataset_files()
-    if not raw_files:
-        st.error(
-            "Pipeline artifacts are missing and no supported raw MovieLens files were found in "
-            "`data/raw`. Add the dataset and refresh the app."
-        )
-        return
+    prior_error = st.session_state.get("_auto_pipeline_error", "")
+    attempted = st.session_state.get("_auto_pipeline_attempted", False)
+    retry_requested = st.session_state.pop("_auto_pipeline_retry", False)
+    if attempted and not retry_requested:
+        if prior_error:
+            st.error("Automatic artifact generation failed in this session.")
+            with st.expander("View auto-run error details", expanded=False):
+                st.code(prior_error, language="text")
+            if st.button("Retry pipeline generation", use_container_width=True):
+                st.session_state["_auto_pipeline_retry"] = True
+                st.rerun()
+            return
+        st.session_state["_auto_pipeline_attempted"] = False
+    st.session_state["_auto_pipeline_attempted"] = True
+
+    if not detect_raw_dataset_files():
+        with st.spinner("Raw dataset not found. Downloading MovieLens dataset..."):
+            ok, msg = ensure_raw_dataset_available()
+        if not ok:
+            st.session_state["_auto_pipeline_error"] = msg
+            st.error(
+                "Pipeline artifacts are missing and raw data could not be prepared automatically. "
+                "Set `MOVIELENS_DATA_URL` (env or Streamlit secrets) to a MovieLens zip and retry."
+            )
+            with st.expander("Details", expanded=False):
+                st.code(msg, language="text")
+            return
+
+    explicit_max_ratings = get_optional_int_setting("AUTO_PIPELINE_MAX_RATINGS")
+    fallback_max_ratings = get_optional_int_setting("AUTO_PIPELINE_FALLBACK_MAX_RATINGS")
+    if fallback_max_ratings is None:
+        fallback_max_ratings = 1_000_000
 
     st.info(f"Auto-running pipeline because {reason}.")
     try:
-        from src.pipeline import build_arg_parser, run_pipeline
-
         with st.spinner("Generating artifacts from raw data..."):
-            parser = build_arg_parser()
-            args = parser.parse_args(
-                [
-                    "all",
-                    "--data-dir",
-                    str(RAW),
-                    "--processed-dir",
-                    str(PROCESSED),
-                    "--output-dir",
-                    str(OUTPUTS),
-                ]
-            )
-            run_pipeline(args)
+            run_pipeline_once(max_ratings=explicit_max_ratings)
         st.cache_data.clear()
+        st.session_state["_auto_pipeline_done"] = True
+        st.session_state["_auto_pipeline_attempted"] = False
+        st.session_state["_auto_pipeline_error"] = ""
         st.success("Pipeline completed. Loading dashboard artifacts.")
-    except Exception as exc:
-        st.error(f"Automatic pipeline run failed: {exc}")
+    except Exception:
+        first_error = traceback.format_exc()
+        if explicit_max_ratings is not None:
+            st.session_state["_auto_pipeline_error"] = first_error
+            st.error("Automatic pipeline run failed.")
+            with st.expander("View auto-run error details", expanded=False):
+                st.code(first_error, language="text")
+            return
+
+        try:
+            with st.spinner(
+                f"Initial run failed. Retrying with AUTO_PIPELINE_FALLBACK_MAX_RATINGS={fallback_max_ratings:,}..."
+            ):
+                run_pipeline_once(max_ratings=fallback_max_ratings)
+            st.cache_data.clear()
+            st.session_state["_auto_pipeline_done"] = True
+            st.session_state["_auto_pipeline_attempted"] = False
+            st.session_state["_auto_pipeline_error"] = ""
+            st.success("Pipeline completed after retry with fallback sampling.")
+        except Exception:
+            second_error = traceback.format_exc()
+            combined = (
+                "Initial run:\n"
+                f"{first_error}\n"
+                "Retry run:\n"
+                f"{second_error}"
+            )
+            st.session_state["_auto_pipeline_error"] = combined
+            st.error("Automatic pipeline run failed.")
+            with st.expander("View auto-run error details", expanded=False):
+                st.code(combined, language="text")
+
+
+def missing_artifact_paths() -> list[str]:
+    return [str(path.relative_to(ROOT)) for path in REQUIRED_ARTIFACTS if not path.exists()]
+
+
+def artifact_ready() -> bool:
+    return all(path.exists() for path in REQUIRED_ARTIFACTS)
+
+
+def show_not_ready_message() -> None:
+    missing = missing_artifact_paths()
+    missing_html = "<br>".join(missing) if missing else "Unknown artifacts missing"
+    st.markdown(
+        '<div class="glass-card" style="text-align:center;padding:2.2rem;">'
+        '<div style="font-size:1.15rem;font-weight:500;color:#dc2626;margin-bottom:0.75rem;">Artifacts not found</div>'
+        '<div style="font-size:0.86rem;color:#6e7191;line-height:1.6;margin-bottom:0.8rem;">'
+        'Automatic pipeline did not produce all required files in this session.'
+        '</div>'
+        '<div style="font-size:0.78rem;color:#8b8ba7;line-height:1.6;margin-bottom:1rem;">'
+        f'{missing_html}'
+        '</div>'
+        '<code style="background:rgba(0,0,0,0.06);padding:0.35rem 0.9rem;border-radius:8px;font-size:0.82rem;">'
+        'python -m src.pipeline app --data-dir data/raw --output-dir outputs --processed-dir data/processed</code></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def show_pipeline_status() -> None:
+    if artifact_ready():
+        return
+    if st.session_state.get("_auto_pipeline_error"):
+        st.error("Auto-run pipeline failed. Expand the error block above and click retry.")
 
 
 def similar_movies(
@@ -541,6 +708,7 @@ with st.sidebar:
 # LOAD DATA
 # ══════════════════════════════════════════════════════════════════════════════
 auto_run_pipeline_if_needed()
+show_pipeline_status()
 
 movies             = load_movies()
 journey_edges      = load_journey_edges()
@@ -549,17 +717,11 @@ item_factors, movie_ids = load_item_factors()
 embedding_3d       = load_embedding_3d()
 evaluation         = load_evaluation()
 
-ready        = not movies.empty and item_factors.size > 0
+ready        = artifact_ready() and not movies.empty and item_factors.size > 0
 network_edges = cooccurrence_edges if not cooccurrence_edges.empty else journey_edges
 
 if not ready:
-    st.markdown(
-        '<div class="glass-card" style="text-align:center;padding:3rem;">'
-        '<div style="font-size:1.15rem;font-weight:500;color:#dc2626;margin-bottom:0.75rem;">Artifacts not found</div>'
-        '<code style="background:rgba(0,0,0,0.06);padding:0.4rem 1rem;border-radius:8px;font-size:0.85rem;">'
-        'python -m src.pipeline all</code></div>',
-        unsafe_allow_html=True,
-    )
+    show_not_ready_message()
     st.stop()
 
 options      = movies.sort_values("title")[["movieId", "title"]]
