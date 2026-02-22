@@ -175,7 +175,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         singular_values=artifacts.singular_values,
     )
 
-    if args.command in {"train", "all", "visualize"} and args.run_tuning:
+    if args.command in {"train", "all", "visualize", "app"} and args.run_tuning:
         grid = [int(x) for x in args.factor_grid.split(",") if x.strip()]
         tuning = tune_svd_factors(
             matrix_bundle.matrix,
@@ -289,24 +289,25 @@ def run_pipeline(args: argparse.Namespace) -> None:
     )
     cooccurrence_edges.to_csv(models_dir / "cooccurrence_edges.csv", index=False)
 
-    if args.command in {"visualize", "all", "train"}:
-        plot_scree(artifacts.singular_values, figures_dir / "scree_plot.png")
-        plot_genre_clustermap(movies, figures_dir / "genre_corr_clustermap.png")
-        box_sample = ratings.sample(min(len(ratings), args.plot_rating_sample), random_state=42)
-        plot_rating_box_by_genre(box_sample, movies, figures_dir / "rating_boxplot_by_genre.png")
+    if args.command in {"visualize", "all", "train", "app"}:
+        if args.command != "app":
+            plot_scree(artifacts.singular_values, figures_dir / "scree_plot.png")
+            plot_genre_clustermap(movies, figures_dir / "genre_corr_clustermap.png")
+            box_sample = ratings.sample(min(len(ratings), args.plot_rating_sample), random_state=42)
+            plot_rating_box_by_genre(box_sample, movies, figures_dir / "rating_boxplot_by_genre.png")
 
-        emb_2d = compute_embedding_frame(
-            item_factors=artifacts.item_factors,
-            movie_ids=matrix_bundle.movie_ids,
-            movies=movies,
-            popularity=popularity,
-            method="tsne",
-            n_components=2,
-            max_points=args.embedding_points,
-            perplexity=args.tsne_perplexity,
-        )
-        emb_2d.to_csv(embeddings_dir / "movie_embedding_2d.csv", index=False)
-        plot_tsne_2d(emb_2d, figures_dir / "movie_embedding_tsne_2d.png")
+            emb_2d = compute_embedding_frame(
+                item_factors=artifacts.item_factors,
+                movie_ids=matrix_bundle.movie_ids,
+                movies=movies,
+                popularity=popularity,
+                method="tsne",
+                n_components=2,
+                max_points=args.embedding_points,
+                perplexity=args.tsne_perplexity,
+            )
+            emb_2d.to_csv(embeddings_dir / "movie_embedding_2d.csv", index=False)
+            plot_tsne_2d(emb_2d, figures_dir / "movie_embedding_tsne_2d.png")
 
         emb_3d = compute_embedding_frame(
             item_factors=artifacts.item_factors,
@@ -321,18 +322,19 @@ def run_pipeline(args: argparse.Namespace) -> None:
         emb_3d.to_csv(embeddings_dir / "movie_embedding_3d.csv", index=False)
         build_plotly_movie_embedding_3d(emb_3d, embeddings_dir / "movie_embedding_3d.html")
 
-        plot_similarity_network_matplotlib(
-            cooccurrence_edges,
-            movies,
-            figures_dir / "movie_similarity_network.png",
-            max_nodes=120,
-        )
+        if args.command != "app":
+            plot_similarity_network_matplotlib(
+                cooccurrence_edges,
+                movies,
+                figures_dir / "movie_similarity_network.png",
+                max_nodes=120,
+            )
         build_plotly_liked_also_liked_network(cooccurrence_edges, movies, embeddings_dir / "liked_also_liked_network.html")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Recommendation engine pipeline")
-    parser.add_argument("command", choices=["profile", "train", "visualize", "all"], help="Pipeline stage")
+    parser.add_argument("command", choices=["profile", "train", "visualize", "all", "app"], help="Pipeline stage")
     parser.add_argument("--data-dir", default="data/raw")
     parser.add_argument("--processed-dir", default="data/processed")
     parser.add_argument("--output-dir", default="outputs")
