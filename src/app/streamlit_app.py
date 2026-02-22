@@ -25,9 +25,25 @@ from src.visualization.interactive_plots import (
 )
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
+RAW        = ROOT / "data" / "raw"
 PROCESSED  = ROOT / "data" / "processed"
 MODELS     = ROOT / "outputs" / "models"
 EMBEDDINGS = ROOT / "outputs" / "embeddings"
+OUTPUTS    = ROOT / "outputs"
+
+REQUIRED_ARTIFACTS = [
+    PROCESSED / "movies_enriched.parquet",
+    MODELS / "journey_edges.csv",
+    MODELS / "cooccurrence_edges.csv",
+    MODELS / "svd_artifacts.npz",
+    MODELS / "evaluation_summary.json",
+    EMBEDDINGS / "movie_embedding_3d.csv",
+]
+RAW_SCHEMA_CANDIDATES = [
+    ("ratings.csv", "movies.csv"),
+    ("ratings.dat", "movies.dat"),
+    ("u.data", "u.item"),
+]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -362,6 +378,71 @@ def load_evaluation() -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
+def detect_raw_dataset_files() -> list[Path]:
+    for schema in RAW_SCHEMA_CANDIDATES:
+        files = [RAW / name for name in schema]
+        if all(path.exists() for path in files):
+            return files
+    return []
+
+
+def pipeline_needs_refresh() -> tuple[bool, str]:
+    missing = [path for path in REQUIRED_ARTIFACTS if not path.exists()]
+    if missing:
+        return True, "required artifacts are missing"
+
+    raw_files = detect_raw_dataset_files()
+    if not raw_files:
+        return False, ""
+
+    newest_raw = max(path.stat().st_mtime for path in raw_files)
+    oldest_artifact = min(path.stat().st_mtime for path in REQUIRED_ARTIFACTS)
+    if newest_raw > oldest_artifact:
+        return True, "raw dataset is newer than generated artifacts"
+    return False, ""
+
+
+def auto_run_pipeline_if_needed() -> None:
+    if st.session_state.get("_auto_pipeline_checked"):
+        return
+    st.session_state["_auto_pipeline_checked"] = True
+
+    should_run, reason = pipeline_needs_refresh()
+    if not should_run:
+        return
+
+    raw_files = detect_raw_dataset_files()
+    if not raw_files:
+        st.error(
+            "Pipeline artifacts are missing and no supported raw MovieLens files were found in "
+            "`data/raw`. Add the dataset and refresh the app."
+        )
+        return
+
+    st.info(f"Auto-running pipeline because {reason}.")
+    try:
+        from src.pipeline import build_arg_parser, run_pipeline
+
+        with st.spinner("Generating artifacts from raw data..."):
+            parser = build_arg_parser()
+            args = parser.parse_args(
+                [
+                    "all",
+                    "--data-dir",
+                    str(RAW),
+                    "--processed-dir",
+                    str(PROCESSED),
+                    "--output-dir",
+                    str(OUTPUTS),
+                ]
+            )
+            run_pipeline(args)
+        st.cache_data.clear()
+        st.success("Pipeline completed. Loading dashboard artifacts.")
+    except Exception as exc:
+        st.error(f"Automatic pipeline run failed: {exc}")
+
+
 def similar_movies(
     source_movie_id: int,
     item_factors: np.ndarray,
@@ -459,6 +540,8 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 # LOAD DATA
 # ══════════════════════════════════════════════════════════════════════════════
+auto_run_pipeline_if_needed()
+
 movies             = load_movies()
 journey_edges      = load_journey_edges()
 cooccurrence_edges = load_cooccurrence_edges()
